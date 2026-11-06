@@ -1,0 +1,130 @@
+# Production compose file — rendered by Terraform into the instance's
+# /opt/mlops-qa/docker-compose.yml from user-data.sh.tftpl.
+#
+# Differs from the repo-root docker-compose.yml (which is for local dev):
+#   * no bind mounts, no --reload; images come from ECR
+#   * Postgres and MinIO are gone — RDS and S3 replace them
+#   * Redis runs here, since the Celery worker needs a broker on the same host
+#   * nginx is the only published port; the API and worker are not reachable
+#     from outside the host
+#
+# The only origin reaching this host is the ALB on :80.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # Broker traffic only. If Redis is lost the queues are lost with it — that
+    # is acceptable here because every item is re-drivable from the S3 events
+    # and the Reprocess button; persistence would imply a guarantee this
+    # topology cannot keep anyway.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    image: ${BACKEND_IMAGE}:${IMAGE_TAG}
+    # One-shot. `up` is invoked for this service by the boot script; the profile
+    # keeps it out of a plain `docker compose up`.
+    profiles: ["tools"]
+    restart: "no"
+    env_file:
+      - .env
+    # Alembic reads DATABASE_URL_SYNC, which is the sync DSN in .env.
+    command: ["alembic", "upgrade", "head"]
+    # No depends_on: migrations only need RDS, which is not a compose service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    image: ${BACKEND_IMAGE}:${IMAGE_TAG}
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Not published to the host — nginx reaches it over the compose network.
+    expose:
+      - "8000"
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      # Trust the ALB's X-Forwarded-* headers so client IPs and scheme are
+      # correct in logs. Restricting to the compose subnet prevents a direct
+      # request from spoofing them.
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  worker:
+    image: ${BACKEND_IMAGE}:${IMAGE_TAG}
+    restart: unless-stopped
+    env_file:
+      - .env
+    command:
+      - celery
+      - -A
+      - app.celery_app.celery_app
+      - worker
+      - --loglevel=info
+      # OpenCV/numpy prespawn threads; forking a threaded process is a
+      # documented source of deadlocks in Celery. Prefork without the thread
+      # pool is safer here.
+      - --concurrency=2
+      - --max-tasks-per-child=50
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  frontend:
+    image: ${FRONTEND_IMAGE}:${IMAGE_TAG}
+    restart: unless-stopped
+    # The single published port. nginx serves the SPA and proxies /api/ to
+    # backend:8000 (see frontend/nginx.conf).
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,177 @@
+name: CI
+
+# Runs on every pull request, and as the gate inside deploy.yml. Nothing here
+# touches AWS.
+#
+# Note there is no `push: branches: [main]` trigger: deploy.yml calls this
+# workflow as its first job, so a push to main runs these checks exactly once,
+# and a failure here stops the deploy rather than racing it.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      skip_docker_build:
+        description: "Skip the image build job (the caller builds and pushes them anyway)."
+        type: boolean
+        default: false
+
+# A new push to the same branch makes the in-flight run obsolete. Keyed on the
+# calling workflow too, so a deploy's CI run and a standalone one never cancel
+# each other.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (lint + tests)
+    runs-on: ubuntu-latest
+
+    services:
+      # The suite defaults to in-memory SQLite so it runs on a laptop, but the
+      # app targets Postgres: JSONB, native enums and ON DELETE CASCADE all
+      # behave differently there. CI is where that difference gets caught, so
+      # it points TEST_DATABASE_URL at a real Postgres.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mlops_qa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint
+        # `ruff check` only. Adding `ruff format --check` would be reasonable,
+        # but the existing code was not written against the formatter and it
+        # would fail the first run on cosmetics — adopt it as its own commit.
+        run: ruff check .
+
+      - name: Verify migrations apply to an empty database
+        # Catches the failure mode unit tests cannot: models drift, the initial
+        # revision goes stale, and production boots into a migration error.
+        # Downgrade proves the revision is reversible before it is relied upon.
+        env:
+          DATABASE_URL_SYNC: postgresql+psycopg2://postgres:postgres@localhost:5432/mlops_qa_test
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Tests
+        env:
+          # asyncpg for the app's async engine; the migration step above used
+          # psycopg2 because Alembic is synchronous.
+          TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/mlops_qa_test
+        run: pytest -q
+
+  frontend:
+    name: Frontend (lint + typecheck + build)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      # The build is the real test: `tsc -b` is strict, and a broken import or
+      # a missing env reference fails here rather than in the Docker build.
+      - run: npm run build
+
+  terraform:
+    name: Terraform (fmt + validate)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: infrastructure/terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.3"
+          terraform_wrapper: false
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        # No backend and no credentials: validate only needs the provider
+        # schemas, so this runs on a fork PR without any AWS access.
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    # Only worth the minutes if the code that goes into them is sound.
+    needs: [backend, frontend]
+    # Skipped when deploy.yml is the caller: that workflow builds and pushes
+    # the same two images immediately afterwards.
+    if: ${{ !inputs.skip_docker_build }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only — pushing is deploy.yml's job, and a PR from a fork must
+      # never be able to publish an image.
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend

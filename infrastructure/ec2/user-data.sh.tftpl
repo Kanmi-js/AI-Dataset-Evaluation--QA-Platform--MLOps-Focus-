@@ -1,0 +1,205 @@
+#!/bin/bash
+# EC2 boot script — rendered by Terraform from user-data.sh.tftpl.
+#
+# Brings up the full stack (nginx, FastAPI, Celery worker, Redis) via Docker
+# Compose. Secrets are pulled from SSM Parameter Store at boot using the
+# instance role; nothing sensitive is baked into this script, which matters
+# because user-data is readable from the instance metadata service.
+#
+# Every step is fail-fast (-e) so a broken boot surfaces as an unhealthy target
+# in the ALB rather than an instance that reports healthy and serves errors.
+
+set -euo pipefail
+
+exec > >(tee -a /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+echo "=== Boot started: $(date -Is) ==="
+
+AWS_REGION="${aws_region}"
+SSM_PREFIX="${ssm_prefix}"
+ECR_REGISTRY="${ecr_registry}"
+BACKEND_IMAGE="${backend_image}"
+FRONTEND_IMAGE="${frontend_image}"
+IMAGE_TAG="${image_tag}"
+S3_BUCKET="${s3_bucket}"
+LOG_GROUP="${log_group}"
+
+APP_DIR=/opt/mlops-qa
+ENV_FILE="$APP_DIR/.env"
+
+# --- 1. Packages ---
+dnf update -y
+dnf install -y docker jq python3
+
+systemctl enable --now docker
+usermod -aG docker ec2-user
+
+# Docker Compose v2 as a CLI plugin — not the ancient python3-docker-compose
+# package, which does not support the `env_file: [{path: ...}]` syntax the
+# compose file uses.
+COMPOSE_VERSION=v2.32.4
+mkdir -p /usr/libexec/docker/cli-plugins
+curl -sSL \
+  "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+  -o /usr/libexec/docker/cli-plugins/docker-compose
+chmod +x /usr/libexec/docker/cli-plugins/docker-compose
+
+systemctl enable --now amazon-ssm-agent
+
+# --- 2. Application directory ---
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
+
+# --- 3. Configuration from SSM ---
+#
+# One call for the whole prefix, then build the .env from the components. The
+# password is percent-encoded here rather than in Terraform, where there is no
+# urlencode function and a literal "#" in the password would silently truncate
+# the DSN at the fragment.
+echo "Reading configuration from $SSM_PREFIX ..."
+
+python3 - "$AWS_REGION" "$SSM_PREFIX" "$S3_BUCKET" <<'PYEOF' > "$ENV_FILE"
+import json
+import sys
+from urllib.parse import quote
+
+import boto3
+
+region, prefix, bucket = sys.argv[1], sys.argv[2], sys.argv[3]
+
+ssm = boto3.client("ssm", region_name=region)
+params = {}
+paginator = ssm.get_paginator("get_parameters_by_path")
+for page in paginator.paginate(Path=prefix, WithDecryption=True):
+    for entry in page["Parameters"]:
+        params[entry["Name"].rsplit("/", 1)[-1]] = entry["Value"]
+
+required = {
+    "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD",
+    "SECRET_KEY", "INTERNAL_API_TOKEN",
+}
+missing = required - params.keys()
+if missing:
+    raise SystemExit(f"Missing SSM parameters: {sorted(missing)}")
+
+user = quote(params["DB_USER"], safe="")
+password = quote(params["DB_PASSWORD"], safe="")
+host = params["DB_HOST"]
+port = params["DB_PORT"]
+name = params["DB_NAME"]
+
+lines = [
+    "ENVIRONMENT=production",
+    "DEBUG=false",
+    # Async for FastAPI, sync for Celery and Alembic.
+    f"DATABASE_URL=postgresql+asyncpg://{user}:{password}@{host}:{port}/{name}",
+    f"DATABASE_URL_SYNC=postgresql+psycopg2://{user}:{password}@{host}:{port}/{name}",
+    # Redis runs as a compose service on this host; the worker talks to it over
+    # the compose network, not localhost.
+    "CELERY_BROKER_URL=redis://redis:6379/0",
+    "CELERY_RESULT_BACKEND=redis://redis:6379/1",
+    # Real S3: no endpoint override, so boto3 builds the AWS URL. Leaving these
+    # empty is what distinguishes this from the MinIO config in local dev.
+    "S3_ENDPOINT_URL=",
+    "S3_PUBLIC_ENDPOINT_URL=",
+    f"S3_BUCKET={bucket}",
+    f"S3_REGION={region}",
+    f"SECRET_KEY={params['SECRET_KEY']}",
+    f"INTERNAL_API_TOKEN={params['INTERNAL_API_TOKEN']}",
+    # Same-origin by default: nginx serves the SPA and proxies /api/ to the
+    # backend, so the browser never makes a cross-origin request.
+    "CORS_ORIGINS=",
+]
+sys.stdout.write("\n".join(lines) + "\n")
+PYEOF
+
+chmod 600 "$ENV_FILE"
+
+# Credentials are supplied by the instance role, so leave the key/secret blank —
+# boto3's default chain picks them up from IMDS.
+{
+  echo "S3_ACCESS_KEY="
+  echo "S3_SECRET_KEY="
+} >> "$ENV_FILE"
+
+# --- 4. Compose file ---
+cat > "$APP_DIR/docker-compose.yml" <<'COMPOSEEOF'
+${compose_template}
+COMPOSEEOF
+
+# --- 5. Log shipping ---
+#
+# Containers keep logging to json-file so `docker compose logs` still works
+# during an SSM session (and in the health-gate dump below); the agent tails
+# those same files into CloudWatch so the logs outlive the instance. That
+# matters here specifically because the ASG replaces the instance on failure,
+# taking its disk with it.
+dnf install -y amazon-cloudwatch-agent
+
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWEOF
+{
+  "agent": { "run_as_user": "root" },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/user-data.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "{instance_id}/boot",
+            "retention_in_days": 7
+          },
+          {
+            "file_path": "/var/lib/docker/containers/*/*-json.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "{instance_id}/containers",
+            "retention_in_days": 7
+          }
+        ]
+      }
+    }
+  }
+}
+CWEOF
+
+# Non-fatal: losing log shipping should not stop the app from serving.
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+  || echo "WARNING: CloudWatch agent failed to start; continuing."
+
+# --- 6. Log in to ECR and pull ---
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+export BACKEND_IMAGE FRONTEND_IMAGE IMAGE_TAG
+docker compose pull
+
+# --- 7. Migrate, then start ---
+#
+# The migration runs in a one-shot container against the sync DSN, before
+# uvicorn binds. If it fails, the instance never becomes healthy and the ALB
+# keeps the previous one serving — which is the behaviour you want.
+echo "Applying database migrations ..."
+docker compose run --rm --no-deps -T migrate
+
+echo "Starting the stack ..."
+docker compose up -d --remove-orphans
+
+# --- 8. Health gate ---
+#
+# Block boot until the API answers, so the ASG's health check grace period is
+# spent waiting on a real signal rather than guessing. Bounded so a genuinely
+# broken deploy fails fast instead of hanging for the full grace period.
+echo "Waiting for the API to become healthy ..."
+for attempt in $(seq 1 60); do
+  if curl -fsS http://localhost/api/v1/health > /dev/null; then
+    echo "=== Boot complete after $attempt attempt(s): $(date -Is) ==="
+    exit 0
+  fi
+  sleep 5
+done
+
+echo "!!! API did not become healthy within 300s — dumping logs !!!"
+docker compose logs --tail=100
+exit 1
