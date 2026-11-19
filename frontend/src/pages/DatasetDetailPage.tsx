@@ -200,7 +200,11 @@ export default function DatasetDetailPage() {
   const items: DataItem[] = dataset?.items ?? [];
   const isVideo = detail !== null && detail.media_type === 'video';
   const telemetry = isVideo ? detail.item_metadata?.telemetry : undefined;
-  const canvasUrl = detail?.processed_url ?? detail?.raw_url ?? '';
+  // A video's raw file is an .mp4, which <img> cannot show — only its
+  // processed poster frame can stand in. Images fall back to the raw upload.
+  const canvasUrl = isVideo
+    ? (detail?.processed_url ?? '')
+    : (detail?.processed_url ?? detail?.raw_url ?? '');
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden bg-pitch-dark font-sans text-zinc-100">
