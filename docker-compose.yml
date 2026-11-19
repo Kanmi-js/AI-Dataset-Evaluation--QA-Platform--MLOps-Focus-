@@ -59,11 +59,10 @@ services:
   backend:
     build: ./backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    # Long form with required:false — a fresh clone comes up on the defaults in
-    # app/config.py instead of erroring out before anything starts.
-    env_file:
-      - path: .env
-        required: false
+    # Short form so it works on every Compose v2 release (the long form with
+    # `required: false` needs v2.24+). That means .env must exist: copy
+    # .env.example once after cloning.
+    env_file: .env
     environment:
       ENVIRONMENT: development
     volumes:
@@ -83,9 +82,7 @@ services:
     # Capped like production: each process loads torch + YOLO (~1-1.5 GB), and
     # Celery's default is one process per CPU core.
     command: celery -A app.celery_app.celery_app worker --loglevel=info --concurrency=2
-    env_file:
-      - path: .env
-        required: false
+    env_file: .env
     environment:
       ENVIRONMENT: development
     volumes:

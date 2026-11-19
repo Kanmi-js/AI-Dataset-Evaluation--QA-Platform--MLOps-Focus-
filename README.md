@@ -61,10 +61,16 @@ docker compose up --build
 Register any email and password on the login page — accounts are created
 locally, there is no external identity provider.
 
-`.env` is optional. Every setting in [`backend/app/config.py`](backend/app/config.py)
-has a working default that matches the Compose services, so a fresh clone boots
-without one. Copy [`.env.example`](.env.example) when you want to change
-something.
+Compose needs a `.env` file to exist, so create one once after cloning:
+
+```bash
+cp .env.example .env
+```
+
+Every setting in [`backend/app/config.py`](backend/app/config.py) has a working
+default that matches the Compose services, so the copied values work as-is.
+Add `ANTHROPIC_API_KEY` and `ELEVENLABS_API_KEY` there for AI commentary and
+voice-over.
 
 Those defaults include placeholder values for `SECRET_KEY` and
 `INTERNAL_API_TOKEN`, which are fine for local work and unacceptable anywhere
