@@ -19,6 +19,9 @@ greenlet==3.1.1
 
 # --- Task queue ---
 celery==5.4.0
+# kombu is Celery's transport layer. Unpinned, pip takes the newest, and
+# kombu >= 5.6 refuses redis-py < 6.1 at worker start ("VersionMismatch").
+kombu==5.4.2
 redis==5.2.1
 
 # --- Object storage (S3 / MinIO) ---
