@@ -50,3 +50,6 @@ Thumbs.db
 
 # Model weights (downloaded by Ultralytics on first use; baked into the image)
 *.pt
+
+# TypeScript incremental build info (tsc -b)
+*.tsbuildinfo
