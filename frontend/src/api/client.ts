@@ -145,4 +145,8 @@ export const api = {
   async reprocessItem(itemId: number): Promise<DataItem> {
     return request<DataItem>(`/items/${itemId}/reprocess`, { method: "POST" });
   },
+
+  async regenerateBreakdown(itemId: number): Promise<DataItem> {
+    return request<DataItem>(`/items/${itemId}/breakdown`, { method: "POST" });
+  },
 };

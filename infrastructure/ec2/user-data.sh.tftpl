@@ -110,6 +110,13 @@ lines = [
     # backend, so the browser never makes a cross-origin request.
     "CORS_ORIGINS=",
 ]
+# Optional: breakdown commentary and voice-over. Created by hand with
+# `aws ssm put-parameter --type SecureString` (see infrastructure/README.md) so
+# the keys never pass through Terraform state. Absent keys just mean template
+# scripts and caption-only breakdowns.
+for optional in ("ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"):
+    if optional in params:
+        lines.append(f"{optional}={params[optional]}")
 sys.stdout.write("\n".join(lines) + "\n")
 PYEOF
 

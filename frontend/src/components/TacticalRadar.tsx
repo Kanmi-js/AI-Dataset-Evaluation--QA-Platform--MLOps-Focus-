@@ -51,7 +51,7 @@ export const TacticalRadar: React.FC<TacticalRadarProps> = ({
   const [frameIdx, setFrameIdx] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
 
-  const frames = telemetry.frames ?? [];
+  const frames = useMemo(() => telemetry.frames ?? [], [telemetry.frames]);
   const simulated = telemetry.source === "simulated";
   const sport = telemetry.sport ?? "football";
   const surface = telemetry.surface;
@@ -294,7 +294,7 @@ export const TacticalRadar: React.FC<TacticalRadarProps> = ({
           {frame.tracked_entities.map((entity) => {
             const px = sx(entity.coordinates.x);
             const py = sy(entity.coordinates.y);
-            const color = entityColor(entity.role);
+            const color = entity.color ?? entityColor(entity.role);
             const ballMark = isBall(entity);
 
             return (

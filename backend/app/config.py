@@ -91,7 +91,42 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(default=25 * 1024 * 1024)        # images, text
     max_video_upload_bytes: int = Field(default=200 * 1024 * 1024)  # match clips
 
+    # --- Video analysis (app/workers/tracking.py) ---
+    #
+    # "yolo" runs the real detector + tracker over the footage. "simulated"
+    # keeps the kinematic placeholder (app/workers/telemetry.py) — the test
+    # suite and CI use it so they do not need torch or model weights.
+    tracker: str = Field(default="yolo")
+    # Ultralytics weight name or path. A bare name is downloaded on first use;
+    # the Dockerfile pre-fetches it so workers do not hit the network per job.
+    detector_weights: str = Field(default="yolo11n.pt")
+    # Frames per second actually run through the detector. Broadcast footage is
+    # 25-60 fps; 10 is enough to follow players and keeps CPU cost bounded.
+    analysis_fps: float = Field(default=10.0)
+    # Only the first N seconds of a clip are analysed and rendered. Breakdowns
+    # are of plays, not full matches.
+    max_analysis_seconds: float = Field(default=90.0)
+
+    # --- Breakdown: script, voice-over, rendered clip ---
+    #
+    # Both keys are optional. Without ANTHROPIC_API_KEY the script falls back to
+    # a template written from the detected events; without ELEVENLABS_API_KEY
+    # the clip renders with captions and no voice. Neither ever blocks the
+    # pipeline.
+    anthropic_api_key: str | None = Field(default=None)
+    commentary_model: str = Field(default="claude-opus-5-5")
+    elevenlabs_api_key: str | None = Field(default=None)
+    # A stock ElevenLabs voice by default. Swap in any voice from your
+    # ElevenLabs library — but do not clone a real person's voice without
+    # their consent (ElevenLabs' terms forbid it too).
+    elevenlabs_voice_id: str = Field(default="pNInz6obpgDQGcFmaJgB")
+    elevenlabs_model_id: str = Field(default="eleven_multilingual_v2")
+    # Longest edge of the rendered breakdown clip, in pixels.
+    render_max_dim: int = Field(default=1280)
+
     @field_validator(
+        "anthropic_api_key",
+        "elevenlabs_api_key",
         "s3_endpoint_url",
         "s3_public_endpoint_url",
         "s3_access_key",

@@ -157,6 +157,19 @@ aws ssm get-parameter --name /mlops-qa-prod/DB_PASSWORD --with-decryption \
   --query Parameter.Value --output text
 ```
 
+**Breakdown API keys** (optional) are *not* created by Terraform, so they never
+enter its state. Add them by hand under the same prefix and they are picked up
+at the next boot (or instance refresh):
+
+```bash
+aws ssm put-parameter --type SecureString --name /mlops-qa-prod/ANTHROPIC_API_KEY --value '...'
+aws ssm put-parameter --type SecureString --name /mlops-qa-prod/ELEVENLABS_API_KEY --value '...'
+# Optional: a voice from your ElevenLabs library
+aws ssm put-parameter --type String --name /mlops-qa-prod/ELEVENLABS_VOICE_ID --value '...'
+```
+
+Without them, breakdowns still render, with a template script and captions.
+
 > Terraform state contains these values regardless — that is inherent to
 > `random_password`. Use the S3 backend with encryption for any real
 > deployment; see the commented block in `versions.tf`.
@@ -199,11 +212,12 @@ Rough monthly, us-east-1, on-demand, at rest:
 
 | | |
 |---|---|
-| EC2 `t3.small` | ~$15 |
+| EC2 `t3.large` (needed for YOLO tracking) | ~$60 |
 | RDS `db.t4g.micro` + 20 GB | ~$15 |
 | ALB | ~$16 + traffic |
 | NAT gateway | **$0** — there isn't one |
 | S3, ECR, Lambda, logs | a few dollars at demo volume |
+| Claude + ElevenLabs | per breakdown; usage-billed by each provider |
 
 The ALB is the least justifiable line item for a single instance. It is here for
 the health checks and because it is where TLS terminates once a certificate

@@ -21,6 +21,10 @@ export interface TrackedEntity {
   coordinates: { x: number; y: number; width: number; height: number };
   speed_mps: number;
   distance_covered_m: number;
+  /** Real tracker only: "A" | "B" | "other". */
+  team?: string | null;
+  /** Real tracker only: overlay colour derived from the team's kit. */
+  color?: string | null;
 }
 
 export interface FrameTelemetry {
@@ -54,6 +58,69 @@ export interface VideoTelemetry {
   total_frames_sampled: number;
   frames: FrameTelemetry[];
   tactical_summary: string;
+  /** Real tracker only: last second of the clip that was analysed. */
+  analysed_until_sec?: number;
+  /** Real tracker only: kit colour per team. */
+  teams?: Record<string, { label: string; colour_name: string; color: string }>;
+}
+
+// --- Tactical events (written by app/workers/events.py) ---
+
+export interface TacticalEvent {
+  id: string;
+  type: "pass" | "long_pass" | "turnover" | "sprint" | string;
+  t: number;
+  t_end: number;
+  frame_index: number;
+  team: string | null;
+  players: number[];
+  confidence: number;
+  description: string;
+  detail: Record<string, unknown>;
+}
+
+export interface TacticalAnalysis {
+  possession: Record<string, number>;
+  events: TacticalEvent[];
+  key_moments: string[];
+}
+
+// --- Breakdown (written by app/workers/tasks.generate_breakdown) ---
+
+export type BreakdownStatus = "queued" | "running" | "ready" | "failed" | "unavailable";
+
+export interface BreakdownSegment {
+  kind: "intro" | "moment" | "outro";
+  event_id: string | null;
+  at_sec: number;
+  text: string;
+  rings: number[];
+  arrows: { from_player: number; to_player: number }[];
+}
+
+export interface BreakdownTimelineEntry {
+  segment: number;
+  source_sec: number;
+  output_start_sec: number;
+  output_end_sec: number;
+}
+
+export interface Breakdown {
+  status: BreakdownStatus;
+  stage?: "script" | "voice" | "render";
+  error?: string;
+  video_key?: string;
+  title?: string;
+  segments?: BreakdownSegment[];
+  /** Model that wrote the script, or "template". */
+  script_source?: string;
+  script_fallback_reason?: string | null;
+  /** "elevenlabs:<voice>" or "none". */
+  voice_source?: string;
+  voice_error?: string | null;
+  tracking_source?: string;
+  render?: { duration_sec: number; timeline: BreakdownTimelineEntry[] };
+  generated_at?: string;
 }
 
 /** Worker-populated metadata. Keys present depend on the item's media type. */
@@ -69,6 +136,8 @@ export interface ItemMetadata {
   duration_sec?: number;
   poster_frame_index?: number;
   telemetry?: VideoTelemetry;
+  analysis?: TacticalAnalysis;
+  breakdown?: Breakdown;
 }
 
 export interface User {
@@ -109,6 +178,7 @@ export interface DataItem {
 export interface DataItemDetail extends DataItem {
   raw_url: string | null;
   processed_url: string | null;
+  breakdown_url: string | null;
 }
 
 export interface DatasetWithItems extends Dataset {

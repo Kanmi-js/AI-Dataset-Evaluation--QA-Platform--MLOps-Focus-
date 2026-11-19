@@ -13,3 +13,4 @@ env/
 .git/
 .gitignore
 tests/__pycache__/
+*.pt

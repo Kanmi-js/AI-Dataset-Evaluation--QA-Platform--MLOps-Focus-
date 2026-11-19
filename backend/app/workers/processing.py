@@ -6,6 +6,7 @@ them bytes, get back (derivative_bytes, metadata_dict, content_type).
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import tempfile
@@ -14,7 +15,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+from app.config import settings
 from app.workers.telemetry import DEFAULT_SPORT, simulate_tracking
+
+TRACKER_SIMULATED = "simulated"
+
+# Key under which processors hand extra output files to the task. The task pops
+# it before persisting metadata: ``{suffix: (bytes, content_type)}``.
+ARTIFACTS_KEY = "_artifacts"
 
 # Used when the container does not report a frame rate. Recorded in the metadata
 # as `fps_assumed` so a reader can tell a measured 25 fps from a guessed one.
@@ -103,15 +111,24 @@ def _read_poster_frame(capture: cv2.VideoCapture, frame_count: int) -> tuple[Any
 
 
 def process_video(
-    raw: bytes, *, sport: str = DEFAULT_SPORT, suffix: str = ".mp4"
+    raw: bytes,
+    *,
+    sport: str = DEFAULT_SPORT,
+    suffix: str = ".mp4",
+    tracker: str | None = None,
 ) -> tuple[bytes, dict[str, Any], str]:
     """Probe a match clip and attach tracking telemetry.
 
     Two outputs. The derivative is a JPEG poster frame, so the dashboard's
     existing image canvas can render a video item with no special-casing. The
-    metadata carries the clip's real properties plus a telemetry block — see
-    ``app.workers.telemetry``, which simulates the trajectories and labels them
-    as such.
+    metadata carries the clip's real properties plus a telemetry block.
+
+    With ``tracker="yolo"`` (the default, from settings) the telemetry comes
+    from a detector and tracker run over the footage (``app.workers.tracking``)
+    and the metadata also gets detected tactical events. The full-resolution
+    tracks are returned under ``ARTIFACTS_KEY`` for the task to store, because
+    they are too large for a JSONB column. With ``tracker="simulated"`` the
+    kinematic placeholder is used and labelled as such.
 
     Returns ``(jpeg_bytes, metadata, content_type)``.
     """
@@ -144,13 +161,23 @@ def process_video(
         finally:
             # Must release before the unlink below, or Windows refuses the delete.
             capture.release()
+
+        if width <= 0 or height <= 0:
+            # Fall back to the decoded frame; dimensions are needed to scale the
+            # overlay, and a real frame is more trustworthy than the header.
+            height, width = poster.shape[:2]
+
+        analysis_block, artifacts = _analyse(
+            handle.name,
+            tracker=tracker or settings.tracker,
+            sport=sport,
+            fps=fps,
+            frame_count=frame_count,
+            width=int(width),
+            height=int(height),
+        )
     finally:
         os.unlink(handle.name)
-
-    if width <= 0 or height <= 0:
-        # Fall back to the decoded frame; dimensions are needed to scale the
-        # overlay, and a real frame is more trustworthy than the header anyway.
-        height, width = poster.shape[:2]
 
     duration_sec = frame_count / fps if frame_count and fps else 0.0
 
@@ -170,16 +197,52 @@ def process_video(
         "duration_sec": round(duration_sec, 2),
         "poster_frame_index": poster_index,
         "quality_flag": quality_flag,
-        "telemetry": simulate_tracking(
-            frame_count=frame_count,
-            fps=fps,
-            width=int(width),
-            height=int(height),
-            sport=sport,
-        ),
+        **analysis_block,
     }
+    if artifacts:
+        metadata[ARTIFACTS_KEY] = artifacts
 
     ok, buf = cv2.imencode(".jpg", poster, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok:
         raise ValueError("Failed to encode poster frame")
     return buf.tobytes(), metadata, "image/jpeg"
+
+
+def _analyse(
+    path: str,
+    *,
+    tracker: str,
+    sport: str,
+    fps: float,
+    frame_count: int,
+    width: int,
+    height: int,
+) -> tuple[dict[str, Any], dict[str, tuple[bytes, str]]]:
+    """Telemetry (and, for a real tracker, events + raw tracks) for a clip."""
+    if tracker == TRACKER_SIMULATED:
+        telemetry = simulate_tracking(
+            frame_count=frame_count, fps=fps, width=width, height=height, sport=sport
+        )
+        return {"telemetry": telemetry}, {}
+
+    # Imported lazily: tracking pulls in torch, which only the worker needs.
+    from app.workers.events import detect_events
+    from app.workers.tracking import track_clip
+
+    telemetry, tracks = track_clip(
+        path,
+        sport=sport,
+        fps=fps,
+        frame_count=frame_count,
+        width=width,
+        height=height,
+        weights=settings.detector_weights,
+        analysis_fps=settings.analysis_fps,
+        max_seconds=settings.max_analysis_seconds,
+    )
+    analysis = detect_events(tracks)
+    tracks_json = json.dumps(tracks, separators=(",", ":")).encode("utf-8")
+    return (
+        {"telemetry": telemetry, "analysis": analysis},
+        {".tracks.json": (tracks_json, "application/json")},
+    )

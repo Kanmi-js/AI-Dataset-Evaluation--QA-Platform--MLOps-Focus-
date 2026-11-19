@@ -8,13 +8,25 @@ The generic dataset-QA pipeline (upload → S3 → Celery → Postgres → revie
 substrate; sports telemetry is the product built on it. Video is one more
 `MediaType` through that same pipeline, not a parallel path.
 
-**Honesty constraint:** the tracking *analysis* is simulated
-(`backend/app/workers/telemetry.py`). Clip probing is real — dimensions, frame
-rate, duration, poster frame — but the trajectories come from a kinematic model.
-Every telemetry payload carries `source: "simulated"`, the UI badges it, and the
-summary text is derived from the generated numbers. Do not remove that flag,
-present simulated figures as measurements, or hard-code statistics that look like
-model output.
+The product: upload a football or basketball clip, get back a voiced tactical
+breakdown video (overlays, freeze-frames with rings and arrows, AI commentary in
+an ex-pro analyst's voice). Pipeline: `tracking.py` (YOLO + ByteTrack, camera
+compensation, kit-colour teams) → `events.py` (possession, passes, turnovers,
+sprints, key moments) → `commentary.py` (Claude, structured output) →
+`voiceover.py` (ElevenLabs) → `render.py` (OpenCV + ffmpeg). See the README's
+"Tactical breakdowns" section.
+
+**Honesty constraint:** say what is measured and what is estimated.
+* Telemetry `source` names what produced it: the model (`yolo11n+bytetrack`) or
+  `"simulated"` for the kinematic placeholder (`TRACKER=simulated`, used by
+  tests/CI). Never drop or fake that flag.
+* Metres and speeds are estimates scaled from player height (no homography);
+  label them as estimates. Summaries are derived from the computed numbers.
+* The commentary may only use detected events: never feed the model, or let it
+  output, invented names, scores or player ids (`commentary._clean` enforces the
+  ids). Every breakdown records `script_source`, `voice_source` and
+  `tracking_source`, and the UI shows them.
+* Do not clone a real person's voice for the voice-over.
 
 # Tech Stack & Architecture
 * **Frontend:** React (Vite, TypeScript, TailwindCSS) for the QA dashboard, the
@@ -76,4 +88,8 @@ model output.
 3. Develop the React dashboard for dataset visualization. ✅
 4. Write Terraform scripts and configure GitHub Actions for deployment. ✅
 5. Replace simulated tracking with a real detector/tracker, keeping the
-   `telemetry` contract and setting `source` to the model's name.
+   `telemetry` contract and setting `source` to the model's name. ✅
+6. Voiced tactical breakdowns: events → Claude script → ElevenLabs voice →
+   rendered clip. ✅
+7. Next: pitch/court keypoints + homography (real metres, true radar
+   positions), jersey-number OCR, shot detection, and a GPU worker.

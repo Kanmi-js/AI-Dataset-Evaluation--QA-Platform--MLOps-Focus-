@@ -32,6 +32,7 @@ EXPECTED_ROUTES = frozenset(
         "/api/v1/datasets/{dataset_id}/items",
         "/api/v1/items/{item_id}",
         "/api/v1/items/{item_id}/annotations",
+        "/api/v1/items/{item_id}/breakdown",
         "/api/v1/items/{item_id}/reprocess",
         "/api/v1/internal/s3-events",
     }

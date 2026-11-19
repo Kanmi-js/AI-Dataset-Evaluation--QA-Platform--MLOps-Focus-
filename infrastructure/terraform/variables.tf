@@ -45,15 +45,17 @@ variable "allowed_http_cidrs" {
 variable "instance_type" {
   description = <<-EOT
     EC2 instance type. The whole stack (FastAPI, Celery worker, Redis, nginx)
-    runs on one instance via docker compose. OpenCV pre-processing is the memory
-    driver; t3.small (2 GB) is the practical floor.
+    runs on one instance via docker compose. YOLO tracking (torch on CPU) is
+    the memory and CPU driver: each worker process holds ~1-1.5 GB while
+    tracking and the worker runs two. t3.large (8 GB) is the practical floor;
+    a compute-optimised c6i.xlarge roughly halves tracking time.
   EOT
   type        = string
-  default     = "t3.small"
+  default     = "t3.large"
 }
 
 variable "root_volume_size" {
-  description = "Root EBS volume size in GB. Container images alone need ~6 GB."
+  description = "Root EBS volume size in GB. The backend image (CPU torch included) is ~3 GB; with old images kept for rollback, budget ~12 GB."
   type        = number
   default     = 30
 }

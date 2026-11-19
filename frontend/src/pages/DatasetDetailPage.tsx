@@ -13,6 +13,7 @@ import { api } from '../api/client';
 import type { DataItem, DataItemDetail, DatasetWithItems, ItemStatus } from '../api/types';
 import ImageCanvas, { type BoundingBox } from '../components/ImageCanvas';
 import { TacticalRadar } from '../components/TacticalRadar';
+import { BreakdownPanel } from '../components/BreakdownPanel';
 
 const STATUS_STYLES: Record<ItemStatus, string> = {
   pending: 'text-zinc-400 border-pitch-border bg-pitch-dark',
@@ -23,6 +24,11 @@ const STATUS_STYLES: Record<ItemStatus, string> = {
 };
 
 const IN_FLIGHT: ItemStatus[] = ['pending', 'processing'];
+const BREAKDOWN_IN_FLIGHT = ['queued', 'running'];
+
+const breakdownStatus = (item: DataItem | undefined) => item?.item_metadata?.breakdown?.status;
+const isBusy = (item: DataItem) =>
+  IN_FLIGHT.includes(item.status) || BREAKDOWN_IN_FLIGHT.includes(breakdownStatus(item) ?? '');
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback;
@@ -40,6 +46,7 @@ export default function DatasetDetailPage() {
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -68,9 +75,10 @@ export default function DatasetDetailPage() {
     void loadDataset();
   }, [loadDataset]);
 
-  // Pre-processing happens in a Celery worker, so an item's status changes
-  // after the response that created it. Poll only while something is in flight.
-  const inFlight = dataset?.items.some((i) => IN_FLIGHT.includes(i.status)) ?? false;
+  // Pre-processing and breakdown rendering happen in Celery workers, so state
+  // changes after the response that started them. Poll only while something
+  // is in flight.
+  const inFlight = dataset?.items.some(isBusy) ?? false;
   useEffect(() => {
     if (!inFlight) return;
     const timer = setInterval(() => void loadDataset({ quiet: true }), 3000);
@@ -80,7 +88,12 @@ export default function DatasetDetailPage() {
   // The list payload omits presigned URLs; the detail endpoint mints them.
   // Re-fetch when the item's own status changes too, so a freshly processed
   // item picks up its poster frame and telemetry without a manual reload.
-  const selectedStatus = dataset?.items.find((i) => i.id === selectedId)?.status;
+  const selectedItem = dataset?.items.find((i) => i.id === selectedId);
+  const selectedStatus = selectedItem?.status;
+  // Breakdown progress lives in item_metadata, so it has to drive a re-fetch
+  // too, or the panel would never see the presigned video URL appear.
+  const selectedBreakdown = breakdownStatus(selectedItem);
+  const selectedStage = selectedItem?.item_metadata?.breakdown?.stage;
   useEffect(() => {
     if (selectedId === null) {
       setDetail(null);
@@ -101,7 +114,7 @@ export default function DatasetDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedId, selectedStatus]);
+  }, [selectedId, selectedStatus, selectedBreakdown, selectedStage]);
 
   const handleUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
@@ -144,6 +157,20 @@ export default function DatasetDetailPage() {
       await loadDataset({ quiet: true });
     } catch (err) {
       setError(errorMessage(err, 'Could not requeue this item'));
+    }
+  };
+
+  const handleRegenerateBreakdown = async () => {
+    if (!detail) return;
+    try {
+      setRegenerating(true);
+      setError(null);
+      await api.regenerateBreakdown(detail.id);
+      await loadDataset({ quiet: true });
+    } catch (err) {
+      setError(errorMessage(err, 'Could not start a new breakdown'));
+    } finally {
+      setRegenerating(false);
     }
   };
 
@@ -261,8 +288,8 @@ export default function DatasetDetailPage() {
 
           {items.length === 0 ? (
             <p className="p-4 font-mono text-[11px] leading-relaxed text-zinc-500">
-              No items yet. Upload match stills or an .mp4 clip — clips get a
-              poster frame and tracking telemetry from the worker.
+              No items yet. Upload match stills or an .mp4 clip — clips are
+              tracked, then turned into a voiced tactical breakdown.
             </p>
           ) : (
             <div className="divide-y divide-pitch-border/50">
@@ -327,6 +354,18 @@ export default function DatasetDetailPage() {
                 <div className="w-full rounded-xl border border-vector-crimson/30 bg-vector-crimson/10 p-3 font-mono text-xs text-vector-crimson">
                   Pre-processing failed: {detail.error}
                 </div>
+              ) : null}
+
+              {isVideo ? (
+                <BreakdownPanel
+                  breakdown={detail.item_metadata?.breakdown}
+                  videoUrl={detail.breakdown_url}
+                  analysis={detail.item_metadata?.analysis}
+                  telemetry={telemetry}
+                  itemInFlight={IN_FLIGHT.includes(detail.status)}
+                  regenerating={regenerating}
+                  onRegenerate={handleRegenerateBreakdown}
+                />
               ) : null}
 
               <div className="w-full rounded-xl border border-pitch-border bg-pitch-card/40 p-2 shadow-2xl backdrop-blur">

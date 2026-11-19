@@ -1,0 +1,12 @@
+# Real player/ball tracking (app/workers/tracking.py). Installed in the Docker
+# image only: CI and the test suite run with TRACKER=simulated and skip these.
+#
+# torch is NOT listed here. The Dockerfile installs the CPU-only build from
+# PyTorch's own index first; listing it here would let pip pull the default
+# CUDA build (~2.5 GB of GPU libraries this stack never uses).
+#
+# Licence note: Ultralytics is AGPL-3.0. Fine for open-source and portfolio
+# use; a closed-source commercial deployment needs an Ultralytics Enterprise
+# licence or a swap to a permissively licensed detector.
+ultralytics==8.4.215
+lap==0.5.14

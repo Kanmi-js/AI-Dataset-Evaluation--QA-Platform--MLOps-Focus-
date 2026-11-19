@@ -7,7 +7,7 @@
 #   redis     Celery broker + result backend
 #   minio     S3-compatible object storage (raw + processed files)
 #   backend   FastAPI API (auto-reload for dev)
-#   worker    Celery worker (OpenCV / text pre-processing)
+#   worker    Celery worker (tracking, breakdown rendering, image/text pre-processing)
 #   frontend  Vite dev server (React QA dashboard)
 
 services:
@@ -80,7 +80,9 @@ services:
 
   worker:
     build: ./backend
-    command: celery -A app.celery_app.celery_app worker --loglevel=info
+    # Capped like production: each process loads torch + YOLO (~1-1.5 GB), and
+    # Celery's default is one process per CPU core.
+    command: celery -A app.celery_app.celery_app worker --loglevel=info --concurrency=2
     env_file:
       - path: .env
         required: false

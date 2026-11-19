@@ -18,6 +18,14 @@ import uuid
 from collections.abc import AsyncGenerator, Iterator
 from typing import Any
 
+# Must run before anything imports app.config: settings are read once. The real
+# tracker needs torch and model weights, which the suite (and CI) does not
+# install; the breakdown stages are tested on hand-built tracks instead
+# (test_breakdown.py). Keys are cleared so no test can call a paid API.
+os.environ["TRACKER"] = "simulated"
+os.environ["ANTHROPIC_API_KEY"] = ""
+os.environ["ELEVENLABS_API_KEY"] = ""
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -27,7 +35,7 @@ from sqlalchemy.pool import NullPool, StaticPool
 from app.database import Base, get_db
 from app.main import app
 from app.services import storage as storage_module
-from app.workers.tasks import process_data_item
+from app.workers.tasks import generate_breakdown, process_data_item
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "sqlite+aiosqlite://")
 
@@ -158,6 +166,14 @@ def celery_delay(monkeypatch: pytest.MonkeyPatch) -> Iterator[RecordingDelay]:
     """Stop every test from trying to reach a Redis broker."""
     recorder = RecordingDelay()
     monkeypatch.setattr(process_data_item, "delay", recorder)
+    yield recorder
+
+
+@pytest.fixture(autouse=True)
+def breakdown_delay(monkeypatch: pytest.MonkeyPatch) -> Iterator[RecordingDelay]:
+    """Same, for the breakdown task."""
+    recorder = RecordingDelay()
+    monkeypatch.setattr(generate_breakdown, "delay", recorder)
     yield recorder
 
 

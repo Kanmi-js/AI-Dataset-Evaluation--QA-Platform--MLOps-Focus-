@@ -47,3 +47,6 @@ infrastructure/terraform/.build/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Model weights (downloaded by Ultralytics on first use; baked into the image)
+*.pt

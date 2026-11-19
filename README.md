@@ -1,19 +1,23 @@
 # TerrainAI — Sports Tactical Analysis & Dataset QA
 
-Upload match footage or stills, let a background worker pre-process them, then
-review the result in a browser dashboard: bounding boxes on a frame canvas, and
-a 2D tactical radar replaying tracked entities over a pitch or court.
+Upload football or basketball footage and get back a **voiced tactical
+breakdown**: the clip replayed with broadcast-style overlays, pausing on the key
+moments to ring the players involved and draw the passes and runs, while an AI
+analyst talks you through it the way ex-pros do on a podcast. The dashboard also
+shows the detected events, possession share, a 2D tactical radar, and a frame
+canvas for human annotation.
 
 The interesting part is the pipeline shape rather than the CV: FastAPI accepts an
 upload, streams it to object storage, and hands the heavy work to a Celery worker
 so the request returns immediately. The dashboard polls until the worker is done
 and then lets a human accept, correct, or re-drive the result.
 
-> **The tracking analysis is simulated.** Clip probing is real — dimensions,
-> frame rate and duration are read off the container, and the poster frame is a
-> decoded frame. The *trajectories* come from a kinematic model, not from
-> tracking the footage. Every payload is tagged `source: "simulated"` and the UI
-> badges it. See [Video telemetry](#video-telemetry).
+> **What is measured and what is estimated.** Players and the ball are detected
+> and tracked in the real footage (YOLO + ByteTrack). Speeds and distances are
+> *estimated* from player height in pixels, with camera pan compensated but no
+> pitch calibration, and events (passes, turnovers, sprints) are heuristics over
+> those tracks. The commentary is written by an AI from those events. The UI
+> labels each of these. See [Tactical breakdowns](#tactical-breakdowns).
 
 ```
 browser ──> nginx ──> FastAPI ──> S3 (raw/)
@@ -21,9 +25,13 @@ browser ──> nginx ──> FastAPI ──> S3 (raw/)
                          └─> Redis ──> Celery worker ──> OpenCV ──> S3 (processed/)
                                               │                      image: edge overlay
                                               │                      text:  normalized copy
-                                              │                      video: poster frame
-                                          PostgreSQL
-                                        (metadata + telemetry JSONB)
+                                              │                      video: poster frame,
+                                              │                        YOLO tracks, events
+                                          PostgreSQL                         │
+                                        (metadata + telemetry JSONB)         ▼
+                                                              Celery: generate_breakdown
+                                                       script (Claude) → voice (ElevenLabs)
+                                                       → render (OpenCV + ffmpeg) → S3
 ```
 
 ## Stack
@@ -163,9 +171,63 @@ cd frontend && npm run lint && npm run typecheck
    `pending` and re-enqueues, which is the escape hatch when pre-processing got
    something wrong.
 
-## Video telemetry
+## Tactical breakdowns
 
-A clip's `item_metadata.telemetry` is written by
+A video goes through two Celery tasks.
+
+**1. `process_data_item`: tracking and events.**
+[`tracking.py`](backend/app/workers/tracking.py) runs YOLO (`yolo11n`) with
+ByteTrack over the clip at `ANALYSIS_FPS` (10 by default), for up to
+`MAX_ANALYSIS_SECONDS` (90). Along the way it:
+
+- estimates camera pan/zoom from background optical flow and maps every frame
+  onto the first one, so a panning camera does not read as players running;
+- clusters each track's shirt colour into two teams (outliers such as referees
+  become `other`);
+- scales pixels to metres from player height (~1.8 m football, ~2.0 m
+  basketball) and discards physically impossible speeds.
+
+[`events.py`](backend/app/workers/events.py) then derives possession (nearest
+player in control of the ball), passes and long passes (possession moves within
+a team), turnovers (it moves between teams), sprints, pressure on the passer and
+each team's width and depth, and picks up to four **key moments**. The full
+tracks go to S3 as `*.tracks.json`; a downsampled copy goes in
+`item_metadata.telemetry` for the radar, and the events in
+`item_metadata.analysis`.
+
+**2. `generate_breakdown`: script, voice, render.**
+
+| Stage | Module | Without its key |
+|---|---|---|
+| Script | [`commentary.py`](backend/app/workers/commentary.py): Claude writes 3-6 segments in an ex-pro analyst's voice, from the detected events only (structured JSON output, validated) | `ANTHROPIC_API_KEY` unset → a template script from the same events |
+| Voice | [`voiceover.py`](backend/app/workers/voiceover.py): ElevenLabs text-to-speech, one request per segment | `ELEVENLABS_API_KEY` unset → captions only, timed at reading pace |
+| Render | [`render.py`](backend/app/workers/render.py): overlays, a freeze per segment (spotlight, rings, pass arrows, word-by-word captions), voice mixed in, H.264 via ffmpeg | always runs |
+
+The result is `*.breakdown.mp4` in S3; its state, script and timeline are in
+`item_metadata.breakdown`, and `GET /items/{id}` returns a presigned
+`breakdown_url` once it is `ready`. `POST /items/{id}/breakdown` re-runs this
+task alone, for example after adding a key. A failed breakdown never fails the
+item.
+
+**Voices.** `ELEVENLABS_VOICE_ID` picks the voice; the default is a stock
+ElevenLabs voice. Pick or design any voice in your ElevenLabs library, but do not
+clone a real player's or pundit's voice without their consent. ElevenLabs'
+terms forbid it, and it would be impersonation.
+
+**Honesty rules**, enforced in code rather than left to the prompt alone:
+
+- Claude only receives the detected events, teams (by kit colour) and track
+  numbers, never anything to invent names or scores from; `_clean` drops any
+  player id it was not given and clamps times to the clip.
+- Every breakdown records `script_source` (model or `template`),
+  `voice_source` and `tracking_source`, and the UI shows all three.
+- Speeds and distances are labelled as estimates everywhere they appear.
+
+### Simulated telemetry (tests and CI)
+
+`TRACKER=simulated` keeps the original kinematic placeholder, which the test
+suite and CI use so they need neither torch nor model weights. A clip's
+`item_metadata.telemetry` is then written by
 [`backend/app/workers/telemetry.py`](backend/app/workers/telemetry.py) and read
 by `GET /api/v1/items/{id}` — there is no separate telemetry endpoint and no
 in-process cache. It survives restarts and is visible to every worker, because
@@ -192,11 +254,7 @@ Three things keep that from drifting into a false claim:
 - the tactical summary is computed from the generated numbers, so it cannot say
   "6.2 m/s" unless the data does.
 
-Replacing the simulation means swapping `simulate_tracking` for a real tracker
-(detector → tracker → homography) that returns the same structure with `source`
-set to the model's name. Nothing downstream changes: the schema, the API and the
-radar already speak that shape, which was the point of building it this way
-first.
+Simulated clips get no `analysis` and no breakdown; the panel says so.
 
 ## API
 
@@ -216,7 +274,8 @@ All routes are under `/api/v1`. Authentication is a bearer token from
 | `POST` | `/datasets/{id}/items` | Upload files and start processing |
 | `GET` | `/items/{id}` | Item detail, with presigned URLs |
 | `PATCH` | `/items/{id}/annotations` | Save annotations |
-| `POST` | `/items/{id}/reprocess` | Re-run pre-processing |
+| `POST` | `/items/{id}/reprocess` | Re-run pre-processing (tracking included) |
+| `POST` | `/items/{id}/breakdown` | Re-run script, voice-over and render only |
 | `GET` | `/health`, `/health/ready` | Liveness and readiness |
 | `POST` | `/internal/s3-events` | Lambda-only; shared-secret guarded |
 
@@ -302,6 +361,15 @@ Worth being explicit about, since the topology implies them:
   (`MAX_VIDEO_UPLOAD_BYTES`, 200 MB by default). Streaming straight to S3, or
   presigned direct-to-bucket uploads, is the fix; raising the cap without that
   change raises the memory ceiling with it.
+- **No pitch calibration yet.** Metres come from player height, so they are
+  estimates, and "width"/"depth" assume a roughly side-on broadcast camera. A
+  pitch-keypoint model plus homography is the next accuracy step.
+- **CPU inference.** About 45 s of tracking per minute of 720p footage on two
+  vCPUs at the default settings. A GPU instance, or `yolo11s` on a GPU for
+  accuracy, is the upgrade path.
+- **Ultralytics is AGPL-3.0.** Fine for an open-source or portfolio project; a
+  closed-source commercial product needs an Ultralytics licence or a permissive
+  detector.
 - **Video decoding depends on the container's codecs.** `process_video` relies
   on the FFmpeg bundled with `opencv-python-headless`. A clip in an unsupported
   container fails the item with a clear error rather than producing empty

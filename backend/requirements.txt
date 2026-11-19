@@ -29,8 +29,15 @@ opencv-python-headless==4.10.0.84
 numpy==2.2.1
 pillow==11.1.0
 
+# --- Breakdown commentary (Claude) ---
+# The voice-over client (ElevenLabs) uses httpx, pinned under Testing below.
+anthropic==2.10.0
+
 # --- Auth & security ---
 passlib[bcrypt]==1.7.4
+# passlib 1.7.4 is unmaintained and breaks on bcrypt>=4.1 ("password cannot be
+# longer than 72 bytes" on every hash). Unpinned, a fresh build pulls 5.x.
+bcrypt==4.0.1
 python-jose[cryptography]==3.3.0
 
 # --- Testing & linting ---
