@@ -45,6 +45,7 @@ def _bgr(r: int, g: int, b: int) -> list[int]:
         ((240, 240, 240), "white"),
         ((20, 20, 20), "black"),
         ((200, 20, 30), "red"),
+        ((215, 70, 40), "red"),  # floodlit red, hue ~11 degrees
         ((20, 160, 60), "green"),
     ],
 )
@@ -69,6 +70,35 @@ def test_torso_colour_ignores_a_wooden_court():
     lab = _torso_colour(frame, box)
     assert lab is not None
     assert colour_name(_lab_to_bgr(lab)) == "navy"
+
+
+def test_torso_colour_finds_the_shirt_under_sponsor_and_number():
+    """Red shirt mostly covered by a white sponsor and an arm: still red.
+
+    Red is under half the torso here. The old per-channel median landed on
+    the skin/sponsor blend and named a Man Utd kit orange.
+    """
+    grass = _bgr(40, 120, 40)
+    frame = np.full((200, 200, 3), grass, dtype=np.uint8)
+    box = (80.0, 40.0, 120.0, 160.0)
+    frame[40:160, 80:120] = _bgr(200, 25, 35)
+    # Torso crop is x 90..110, y 58..100.
+    frame[60:75, 90:110] = _bgr(245, 245, 245)  # sponsor, ~36%
+    frame[78:100, 90:98] = _bgr(225, 170, 140)  # arm across the chest, ~21%
+    lab = _torso_colour(frame, box)
+    assert lab is not None
+    assert colour_name(_lab_to_bgr(lab)) == "red"
+
+
+def test_torso_colour_white_kit_with_coloured_trim_stays_white():
+    grass = _bgr(40, 120, 40)
+    frame = np.full((200, 200, 3), grass, dtype=np.uint8)
+    box = (80.0, 40.0, 120.0, 160.0)
+    frame[40:160, 80:120] = _bgr(240, 240, 240)
+    frame[64:72, 90:110] = _bgr(200, 25, 35)  # thin red band, ~19%
+    lab = _torso_colour(frame, box)
+    assert lab is not None
+    assert colour_name(_lab_to_bgr(lab)) == "white"
 
 
 def test_torso_colour_keeps_a_kit_that_matches_the_floor():

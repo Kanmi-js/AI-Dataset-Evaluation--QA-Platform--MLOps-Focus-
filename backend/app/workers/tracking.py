@@ -276,7 +276,59 @@ def _torso_colour(frame: np.ndarray, box: tuple[float, float, float, float]) -> 
 
     if keep.sum() < 8:
         return None
-    return np.median(lab[keep], axis=0).astype(np.float32)
+    return _dominant_lab(lab[keep])
+
+
+def _dominant_lab(pixels: np.ndarray) -> np.ndarray:
+    """Kit colour from a torso crop's pixels (N x 3 Lab).
+
+    A plain median blends the shirt with whatever sits on it: a white sponsor,
+    the number, an arm. On a red kit that blend lands on orange. Instead the
+    pixels are split into up to three patches and the kit is chosen from them:
+
+    * skin-toned patches are dropped when anything else is sizeable;
+    * a strongly coloured patch covering a quarter of the torso beats a larger
+      washed-out one (a red shirt under a big white sponsor), while a white kit
+      with small coloured trim stays white;
+    * otherwise the largest patch wins.
+    """
+    pixels = pixels.astype(np.float32)
+    if len(pixels) < 30:
+        return np.median(pixels, axis=0).astype(np.float32)
+    k = 3 if len(pixels) >= 60 else 2
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, _ = cv2.kmeans(pixels, k, None, criteria, 2, cv2.KMEANS_PP_CENTERS)
+    labels = labels.reshape(-1)
+
+    patches = []
+    for c in range(k):
+        members = pixels[labels == c]
+        if not len(members):
+            continue
+        centre = np.median(members, axis=0)
+        bgr = np.array(_lab_to_bgr(centre), dtype=np.uint8).reshape(1, 1, 3)
+        h, sat, val = (int(v) for v in cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).reshape(3))
+        hue = h * 2
+        patches.append(
+            {
+                "share": len(members) / len(pixels),
+                "centre": centre,
+                "sat": sat,
+                "skin": 5 <= hue <= 40 and 35 <= sat <= 170 and val >= 120,
+            }
+        )
+    patches.sort(key=lambda p: p["share"], reverse=True)
+
+    non_skin = [p for p in patches if not p["skin"]]
+    if non_skin and max(p["share"] for p in non_skin) >= 0.2:
+        patches = non_skin
+
+    top = patches[0]
+    if top["sat"] < 45:
+        coloured = [p for p in patches if p["sat"] >= 60 and p["share"] >= 0.25]
+        if coloured:
+            top = coloured[0]
+    return np.asarray(top["centre"], dtype=np.float32)
 
 
 def _lab_to_bgr(lab: np.ndarray) -> list[int]:
@@ -306,10 +358,12 @@ def colour_name(bgr: list[int]) -> str:
         return "blue"
     if 140 <= hue < 175:
         return "teal" if v < 150 else "turquoise"
-    if 15 <= hue < 40 and v < 140:
+    if 18 <= hue < 40 and v < 140:
         return "brown"
     for limit, name in (
-        (15, "red"),
+        # Red kits under floodlights drift to ~10-17 degrees; orange starts
+        # nearer 20, so the boundary sits at 18 rather than 15.
+        (18, "red"),
         (40, "orange"),
         (70, "yellow"),
         (140, "green"),
