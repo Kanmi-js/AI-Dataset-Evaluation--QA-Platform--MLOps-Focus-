@@ -17,7 +17,14 @@ FROM python:3.12-slim AS runtime
 # OpenCV (headless) still needs libGL/glib at runtime. ffmpeg decodes and
 # encodes video for the breakdown renderer and voice-over; DejaVu is the
 # caption font it draws with.
-RUN apt-get update \
+#
+# Debian's mirror is switched from http:// to https:// first: some networks
+# block or drop plain port-80 traffic, which makes `apt-get update` time out.
+# The python:slim base already ships ca-certificates, so HTTPS works as-is.
+RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do \
+        if [ -f "$f" ]; then sed -i 's|http://deb.debian.org|https://deb.debian.org|g' "$f"; fi; \
+    done \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 curl ffmpeg fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
