@@ -53,11 +53,11 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 
 # Bake the detector weights into the image so workers never download per job.
 # Outside /app because local dev bind-mounts the source over /app.
-ENV DETECTOR_WEIGHTS=/opt/models/yolo11n.pt \
+ENV DETECTOR_WEIGHTS=/opt/models/yolo11s.pt \
     YOLO_CONFIG_DIR=/tmp/Ultralytics
 RUN mkdir -p /opt/models \
-    && curl -fsSL -o /opt/models/yolo11n.pt \
-        https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt \
+    && curl -fsSL -o /opt/models/yolo11s.pt \
+        https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt \
     && python -c "import cv2, ultralytics, torch; print(cv2.__version__, ultralytics.__version__, torch.__version__)"
 
 COPY . .

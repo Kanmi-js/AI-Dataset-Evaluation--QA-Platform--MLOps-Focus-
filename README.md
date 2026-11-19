@@ -182,16 +182,25 @@ cd frontend && npm run lint && npm run typecheck
 A video goes through two Celery tasks.
 
 **1. `process_data_item`: tracking and events.**
-[`tracking.py`](backend/app/workers/tracking.py) runs YOLO (`yolo11n`) with
-ByteTrack over the clip at `ANALYSIS_FPS` (10 by default), for up to
-`MAX_ANALYSIS_SECONDS` (90). Along the way it:
+[`tracking.py`](backend/app/workers/tracking.py) runs YOLO (`yolo11s` at
+`INFERENCE_SIZE` 1280 px) over the clip at `ANALYSIS_FPS` (10 by default), for
+up to `MAX_ANALYSIS_SECONDS` (90). Along the way it:
 
+- tracks **players** with ByteTrack, then stitches tracks that broke at a
+  screen or crossing (same kit, runnable distance, short gap) and renumbers
+  them 1..N;
+- picks the **ball** from raw detections rather than through the tracker
+  (which drops anything under 0.25 confidence, i.e. most small, blurred
+  balls), filtering by size relative to players and by continuity with the
+  last position;
 - estimates camera pan/zoom from background optical flow and maps every frame
   onto the first one, so a panning camera does not read as players running;
-- clusters each track's shirt colour into two teams (outliers such as referees
-  become `other`);
+- clusters each track's shirt colour into two teams, after removing pixels
+  that match what is behind the player (grass, a wooden court, boards);
+  outliers such as referees become `other`;
 - scales pixels to metres from player height (~1.8 m football, ~2.0 m
-  basketball) and discards physically impossible speeds.
+  basketball), measures speed over half-second windows, and discards speeds
+  impossible for the sport (11 m/s football, 9.5 m/s basketball).
 
 [`events.py`](backend/app/workers/events.py) then derives possession (nearest
 player in control of the ball), passes and long passes (possession moves within
@@ -370,9 +379,13 @@ Worth being explicit about, since the topology implies them:
 - **No pitch calibration yet.** Metres come from player height, so they are
   estimates, and "width"/"depth" assume a roughly side-on broadcast camera. A
   pitch-keypoint model plus homography is the next accuracy step.
-- **CPU inference.** About 45 s of tracking per minute of 720p footage on two
-  vCPUs at the default settings. A GPU instance, or `yolo11s` on a GPU for
-  accuracy, is the upgrade path.
+- **CPU inference.** Roughly 3 minutes of tracking per minute of 720p footage
+  on four vCPUs with the defaults (`yolo11s`, 1280 px). `DETECTOR_WEIGHTS=yolo11n.pt`
+  and `INFERENCE_SIZE=960` are about 4x faster but miss the ball more often.
+  A GPU worker is the real fix.
+- **The ball is still the weak point.** COCO's generic "sports ball" class is
+  not trained on broadcast footage. A detector fine-tuned on football and
+  basketball frames is the next big accuracy step for possession and passes.
 - **Ultralytics is AGPL-3.0.** Fine for an open-source or portfolio project; a
   closed-source commercial product needs an Ultralytics licence or a permissive
   detector.

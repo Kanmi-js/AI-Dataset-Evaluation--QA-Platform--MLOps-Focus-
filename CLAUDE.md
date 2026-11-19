@@ -17,7 +17,7 @@ sprints, key moments) → `commentary.py` (Claude, structured output) →
 "Tactical breakdowns" section.
 
 **Honesty constraint:** say what is measured and what is estimated.
-* Telemetry `source` names what produced it: the model (`yolo11n+bytetrack`) or
+* Telemetry `source` names what produced it: the model (`yolo11s+bytetrack`) or
   `"simulated"` for the kinematic placeholder (`TRACKER=simulated`, used by
   tests/CI). Never drop or fake that flag.
 * Metres and speeds are estimates scaled from player height (no homography);

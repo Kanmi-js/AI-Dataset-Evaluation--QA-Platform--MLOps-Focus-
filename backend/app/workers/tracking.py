@@ -45,23 +45,65 @@ logger = logging.getLogger(__name__)
 COCO_PERSON = 0
 COCO_SPORTS_BALL = 32
 
-# Inference resolution. 640 (the Ultralytics default) loses the ball on wide
-# broadcast shots; 960 keeps it at roughly 2x the CPU cost.
-INFERENCE_SIZE = 960
-DETECTION_CONF = 0.15
+# Default inference resolution (overridable via settings.inference_size). The
+# ball on a wide broadcast shot is a handful of pixels; 640 (the Ultralytics
+# default) loses it, 1280 keeps it at roughly 4x the CPU cost of 640.
+INFERENCE_SIZE = 1280
+
+# Raw detections are kept down to this confidence. Players then go through
+# ByteTrack, which separates strong and weak detections itself; the ball does
+# not (see _pick_ball), because a tracker will not start a track below 0.25 and
+# a small, fast, motion-blurred ball rarely scores that high.
+DETECTION_CONF = 0.05
+# With no recent ball position to support it, a lone candidate needs this much.
+BALL_START_CONF = 0.15
+# A candidate this confident is accepted even if it is far from the last one.
+BALL_SURE_CONF = 0.35
 
 # Typical standing height, used to turn a bounding box into metres per pixel.
 PLAYER_HEIGHT_M = {"football": 1.80, "basketball": 2.00}
 
-# Anything faster than this between two samples is a tracking glitch (an ID
-# switch, a bad camera estimate), not a player. Usain Bolt peaks near 12.4 m/s.
-MAX_PLAUSIBLE_SPEED_MPS = 11.0
+# Ball diameter (football ~0.22 m, basketball ~0.24 m) relative to player
+# height, with generous slack for motion blur and box padding. Candidates
+# outside this band are heads, hoops, logos or crowd, not the ball.
+BALL_SIZE_RATIO = (0.04, 0.30)
+
+# Fastest the ball plausibly travels between two analysed frames, in m/s: a
+# struck football reaches ~30 m/s, a basketball pass ~15 m/s.
+MAX_BALL_SPEED_MPS = {"football": 32.0, "basketball": 18.0}
+
+# Anything faster than this is a tracking glitch (an ID switch, a bad camera
+# estimate, a box shrinking behind a defender), not a player. Football
+# sprinters top out near 10.5 m/s; basketball's short court caps around 9.
+MAX_PLAUSIBLE_SPEED_MPS = {"football": 11.0, "basketball": 9.5}
+
+# Speeds are measured over this window rather than frame to frame, so box
+# jitter is averaged out instead of read as acceleration.
+SPEED_WINDOW_SEC = 0.5
 
 # A track must be seen this many times to count as a player rather than noise.
 MIN_TRACK_OBSERVATIONS = 3
 
 # Ball gaps up to this many analysed frames are filled by interpolation.
-MAX_BALL_GAP = 4
+MAX_BALL_GAP = 6
+
+# ByteTrack tuning. The buffer is in analysed frames (10 fps by default), so 30
+# keeps a lost player's ID alive for ~3 s through screens and crossings.
+TRACKER_SETTINGS = {
+    "tracker_type": "bytetrack",
+    "track_high_thresh": 0.25,
+    "track_low_thresh": 0.1,
+    "new_track_thresh": 0.3,
+    "track_buffer": 30,
+    "match_thresh": 0.8,
+    "fuse_score": True,
+    "model": None,
+}
+
+# Tracklet stitching: a track that ends and another that starts within this
+# window, close enough to be the same runner and in the same kit, are merged.
+STITCH_MAX_GAP_SEC = 2.0
+STITCH_MAX_COLOUR_DIST = 28.0
 
 
 # ---------------------------------------------------------------------------
@@ -168,24 +210,73 @@ def _background_mask(shape: tuple[int, int], boxes: list[tuple[float, ...]]) -> 
     return mask
 
 
+# Torso pixels within this Lab distance of the surrounding background are
+# treated as background (court floor, pitch, advertising boards) and dropped.
+BACKGROUND_COLOUR_DIST = 22.0
+
+
+def _crop(frame: np.ndarray, x1: float, y1: float, x2: float, y2: float) -> np.ndarray:
+    h, w = frame.shape[:2]
+    xa, xb = int(max(x1, 0)), int(min(x2, w))
+    ya, yb = int(max(y1, 0)), int(min(y2, h))
+    if xb <= xa or yb <= ya:
+        return frame[0:0, 0:0]
+    return frame[ya:yb, xa:xb]
+
+
+def _background_lab(frame: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray | None:
+    """Median Lab colour of the strips either side of a player, at torso height.
+
+    This is whatever the player is standing in front of: grass, a wooden or
+    painted court, boards. Sampling it per player means the kit filter works on
+    any surface, not only on green pitches.
+    """
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    ty1, ty2 = y1 + h * 0.15, y1 + h * 0.55
+    strips = [
+        _crop(frame, x1 - w * 0.45, ty1, x1 - w * 0.05, ty2),
+        _crop(frame, x2 + w * 0.05, ty1, x2 + w * 0.45, ty2),
+    ]
+    pixels = [cv2.cvtColor(s, cv2.COLOR_BGR2LAB).reshape(-1, 3) for s in strips if s.size]
+    if not pixels:
+        return None
+    stacked = np.concatenate(pixels)
+    if len(stacked) < 8:
+        return None
+    return np.median(stacked, axis=0).astype(np.float32)
+
+
 def _torso_colour(frame: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray | None:
-    """Median Lab colour of the shirt area, with pitch-green pixels removed."""
+    """Median Lab colour of the shirt, with background-coloured pixels removed.
+
+    Pixels matching the local background (and, as a backstop, pitch green) are
+    dropped before taking the median, so a player in front of a light wooden
+    floor is not read as wearing orange.
+    """
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     if w < 6 or h < 14:
         return None
-    tx1, tx2 = int(x1 + w * 0.25), int(x2 - w * 0.25)
-    ty1, ty2 = int(y1 + h * 0.15), int(y1 + h * 0.50)
-    crop = frame[max(ty1, 0) : max(ty2, 0), max(tx1, 0) : max(tx2, 0)]
+    crop = _crop(frame, x1 + w * 0.25, y1 + h * 0.15, x2 - w * 0.25, y1 + h * 0.50)
     if crop.size == 0:
         return None
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    green = (hsv[..., 0] > 35) & (hsv[..., 0] < 85) & (hsv[..., 1] > 60)
-    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3)
-    keep = lab[~green.reshape(-1)]
-    if len(keep) < 8:
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    green = (hsv[:, 0] > 35) & (hsv[:, 0] < 85) & (hsv[:, 1] > 60)
+    keep = ~green
+
+    background = _background_lab(frame, box)
+    if background is not None:
+        near_bg = np.linalg.norm(lab - background, axis=1) < BACKGROUND_COLOUR_DIST
+        if (keep & ~near_bg).sum() >= 8:
+            keep &= ~near_bg
+        # Otherwise the kit really is the background's colour (white on a white
+        # floor); keep the green-filtered pixels rather than return nothing.
+
+    if keep.sum() < 8:
         return None
-    return np.median(keep, axis=0).astype(np.float32)
+    return np.median(lab[keep], axis=0).astype(np.float32)
 
 
 def _lab_to_bgr(lab: np.ndarray) -> list[int]:
@@ -198,18 +289,30 @@ def colour_name(bgr: list[int]) -> str:
     """Rough human name for a kit colour, for captions and the script."""
     pixel = np.array(bgr, dtype=np.uint8).reshape(1, 1, 3)
     h, s, v = (int(c) for c in cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV).reshape(3))
-    if v < 60:
+    if v < 55:
         return "black"
     if s < 45:
-        return "white" if v > 170 else "grey"
+        if v > 185:
+            return "white"
+        return "grey" if v > 95 else "dark grey"
     hue = h * 2  # OpenCV hue is 0-179
+    if 175 <= hue < 260:
+        # Blues are where kits differ most and plain "blue" helps least:
+        # navy vs sky blue is usually exactly what separates the two teams.
+        if v < 115:
+            return "navy"
+        if s < 140 and v > 150:
+            return "light blue"
+        return "blue"
+    if 140 <= hue < 175:
+        return "teal" if v < 150 else "turquoise"
+    if 15 <= hue < 40 and v < 140:
+        return "brown"
     for limit, name in (
         (15, "red"),
         (40, "orange"),
         (70, "yellow"),
-        (160, "green"),
-        (200, "cyan"),
-        (255, "blue"),
+        (140, "green"),
         (290, "purple"),
         (340, "pink"),
         (360, "red"),
@@ -245,14 +348,19 @@ def _assign_teams(colours: dict[int, list[np.ndarray]]) -> tuple[dict[int, str],
     if len(track_ids) < 4:
         return assignment, teams
 
-    vectors = np.array(
+    raw = np.array(
         [np.median(np.array(colours[tid]), axis=0) for tid in track_ids], dtype=np.float32
     )
+    # Lightness is halved for clustering: the same shirt in shadow and in
+    # floodlight differs mostly in L, while two different kits differ in hue.
+    weights = np.array([0.5, 1.0, 1.0], dtype=np.float32)
+    vectors = raw * weights
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.5)
     _, labels, centres = cv2.kmeans(vectors, 2, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
     labels = labels.reshape(-1)
+    centres = centres / weights
 
-    distances = np.linalg.norm(vectors - centres[labels], axis=1)
+    distances = np.linalg.norm(vectors - (centres * weights)[labels], axis=1)
     cutoff = max(float(np.median(distances)) * 2.5, 18.0)
 
     # Larger cluster becomes Team A so the naming is stable run to run.
@@ -286,6 +394,15 @@ def _load_model(weights: str):
     return YOLO(weights)
 
 
+def _new_tracker():
+    """A fresh ByteTrack instance, driven by hand with player detections only."""
+    from types import SimpleNamespace
+
+    from ultralytics.trackers.byte_tracker import BYTETracker
+
+    return BYTETracker(SimpleNamespace(**TRACKER_SETTINGS))
+
+
 def track_clip(
     path: str | Path,
     *,
@@ -297,6 +414,7 @@ def track_clip(
     weights: str,
     analysis_fps: float,
     max_seconds: float,
+    inference_size: int = INFERENCE_SIZE,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run detection + tracking over a clip. Returns ``(telemetry, tracks)``."""
     profile = resolve_profile(sport)
@@ -304,9 +422,10 @@ def track_clip(
     limit = int(max_seconds * fps) if max_seconds > 0 else frame_count
     last_frame = min(frame_count, limit) if frame_count > 0 else limit
 
-    # A fresh model per clip so ByteTrack's IDs and state never leak between
+    # Fresh model and tracker per clip so IDs and state never leak between
     # clips processed by the same worker.
     model = _load_model(weights)
+    tracker = _new_tracker()
     source = f"{Path(weights).stem}+bytetrack"
 
     capture = cv2.VideoCapture(str(path))
@@ -318,6 +437,8 @@ def track_clip(
     prev_gray: np.ndarray | None = None
     prev_boxes: list[tuple[float, ...]] = []
     to_ref = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    last_ball: tuple[float, float, float] | None = None
+    frames_since_ball = 0
 
     try:
         index = 0
@@ -331,43 +452,55 @@ def track_clip(
             if not ok:
                 break
 
-            result = model.track(
+            # One detector pass for everything; players and ball then part ways.
+            result = model.predict(
                 image,
-                persist=True,
                 classes=[COCO_PERSON, COCO_SPORTS_BALL],
-                tracker="bytetrack.yaml",
                 conf=DETECTION_CONF,
-                imgsz=INFERENCE_SIZE,
+                imgsz=inference_size,
                 verbose=False,
             )[0]
+            detections = result.boxes.cpu().numpy()
+            cls = detections.cls.astype(int)
 
             frame = _Frame(index=index, timestamp=index / fps, to_ref=to_ref)
-            boxes = result.boxes
-            best_ball: tuple[float, float, float, float] | None = None  # conf, cx, cy, r
-            if boxes is not None and len(boxes):
-                xyxy = boxes.xyxy.cpu().numpy()
-                cls = boxes.cls.cpu().numpy().astype(int)
-                conf = boxes.conf.cpu().numpy()
-                ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
-                for j in range(len(xyxy)):
-                    x1, y1, x2, y2 = (float(v) for v in xyxy[j])
-                    if cls[j] == COCO_SPORTS_BALL:
-                        if best_ball is None or conf[j] > best_ball[0]:
-                            radius = max(x2 - x1, y2 - y1) / 2.0
-                            best_ball = (float(conf[j]), (x1 + x2) / 2, (y1 + y2) / 2, radius)
-                        continue
-                    if ids is None:
-                        continue
-                    track_id = int(ids[j])
-                    box = (x1, y1, x2, y2)
-                    frame.players.append(_PlayerObs(track_id, box, float(conf[j])))
-                    colour = _torso_colour(image, box)
-                    if colour is not None:
-                        samples = colours.setdefault(track_id, [])
-                        if len(samples) < 40:
-                            samples.append(colour)
-            if best_ball is not None:
-                frame.ball = best_ball[1:]
+
+            people = detections[cls == COCO_PERSON]
+            tracked = tracker.update(people, image) if len(people) else np.empty((0, 8))
+            for row in tracked:
+                x1, y1, x2, y2, track_id = (float(v) for v in row[:5])
+                box = (x1, y1, x2, y2)
+                frame.players.append(_PlayerObs(int(track_id), box, float(row[5])))
+                colour = _torso_colour(image, box)
+                if colour is not None:
+                    samples = colours.setdefault(int(track_id), [])
+                    if len(samples) < 40:
+                        samples.append(colour)
+
+            confident_heights = [
+                float(b[3] - b[1])
+                for b, c in zip(people.xyxy, people.conf, strict=True)
+                if c >= 0.3
+            ]
+            person_h = float(np.median(confident_heights)) if confident_heights else None
+            balls = detections[cls == COCO_SPORTS_BALL]
+            candidates = [
+                (float(c), (b[0] + b[2]) / 2, (b[1] + b[3]) / 2, max(b[2] - b[0], b[3] - b[1]) / 2)
+                for b, c in zip(balls.xyxy, balls.conf, strict=True)
+            ]
+            dt = stride / fps * (frames_since_ball + 1)
+            frame.ball = _pick_ball(
+                candidates,
+                previous=last_ball,
+                person_height_px=person_h,
+                max_jump_px=_max_ball_jump_px(profile.name, person_h, dt),
+            )
+            if frame.ball is not None:
+                last_ball, frames_since_ball = frame.ball, 0
+            else:
+                frames_since_ball += 1
+                if frames_since_ball > MAX_BALL_GAP * 2:
+                    last_ball = None  # stale: require a confident re-acquisition
 
             # Camera motion relative to the previous analysed frame.
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -388,6 +521,8 @@ def track_clip(
         raise ValueError("No frames could be decoded for tracking")
 
     _fill_ball_gaps(frames)
+    _stitch_tracklets(frames, colours, profile.name)
+    _renumber_tracks(frames, colours)
     team_of, teams = _assign_teams(colours)
     player_stats, per_frame_speed = _kinematics(frames, team_of, profile.name)
 
@@ -408,6 +543,58 @@ def track_clip(
     return telemetry, tracks
 
 
+# ---------------------------------------------------------------------------
+# Ball
+# ---------------------------------------------------------------------------
+
+
+def _max_ball_jump_px(sport: str, person_height_px: float | None, dt: float) -> float | None:
+    """How far, in pixels, the ball can plausibly move in ``dt`` seconds."""
+    if not person_height_px or dt <= 0:
+        return None
+    px_per_m = person_height_px / PLAYER_HEIGHT_M.get(sport, 1.8)
+    return MAX_BALL_SPEED_MPS.get(sport, 30.0) * dt * px_per_m + person_height_px * 0.5
+
+
+def _pick_ball(
+    candidates: list[tuple[float, float, float, float]],
+    *,
+    previous: tuple[float, float, float] | None,
+    person_height_px: float | None,
+    max_jump_px: float | None,
+) -> tuple[float, float, float] | None:
+    """Choose this frame's ball from ``(conf, cx, cy, radius)`` candidates.
+
+    Size is checked against player height, so heads, hoops and crowd blobs are
+    dropped. With a recent ball position, the candidate that is both confident
+    and close to it wins, and one that teleports is rejected unless it is very
+    confident. Without one, only a reasonably confident candidate starts a new
+    trail.
+    """
+    plausible = candidates
+    if person_height_px:
+        lo, hi = BALL_SIZE_RATIO
+        plausible = [
+            c for c in candidates if lo * person_height_px <= 2 * c[3] <= hi * person_height_px
+        ]
+    if not plausible:
+        return None
+
+    if previous is None or not max_jump_px:
+        best = max(plausible, key=lambda c: c[0])
+        return best[1:] if best[0] >= BALL_START_CONF else None
+
+    def score(c: tuple[float, float, float, float]) -> float:
+        jump = math.hypot(c[1] - previous[0], c[2] - previous[1]) / max_jump_px
+        return c[0] - 0.4 * min(jump, 2.0)
+
+    for c in sorted(plausible, key=score, reverse=True):
+        jump = math.hypot(c[1] - previous[0], c[2] - previous[1])
+        if jump <= max_jump_px or c[0] >= BALL_SURE_CONF:
+            return c[1:]
+    return None
+
+
 def _fill_ball_gaps(frames: list[_Frame]) -> None:
     """Linearly interpolate short gaps in ball detections."""
     seen = [i for i, f in enumerate(frames) if f.ball is not None]
@@ -423,11 +610,147 @@ def _fill_ball_gaps(frames: list[_Frame]) -> None:
             frames[a + k].ball_interpolated = True
 
 
+# ---------------------------------------------------------------------------
+# Track identity
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Tracklet:
+    track_id: int
+    first_pos: int
+    last_pos: int
+    first_t: float
+    last_t: float
+    first_ref: tuple[float, float]
+    last_ref: tuple[float, float]
+    metres_per_px: float
+    colour: np.ndarray | None
+
+
+def _tracklets(
+    frames: list[_Frame], colours: dict[int, list[np.ndarray]], sport: str
+) -> dict[int, _Tracklet]:
+    height_m = PLAYER_HEIGHT_M.get(sport, 1.8)
+    out: dict[int, _Tracklet] = {}
+    heights: dict[int, list[float]] = {}
+    for pos, frame in enumerate(frames):
+        scale = _scale_of(frame.to_ref)
+        for obs in frame.players:
+            ref = _apply(frame.to_ref, *_foot_point(obs.box))
+            heights.setdefault(obs.track_id, []).append((obs.box[3] - obs.box[1]) * scale)
+            t = out.get(obs.track_id)
+            if t is None:
+                out[obs.track_id] = _Tracklet(
+                    obs.track_id, pos, pos, frame.timestamp, frame.timestamp, ref, ref, 0.0, None
+                )
+            else:
+                t.last_pos, t.last_t, t.last_ref = pos, frame.timestamp, ref
+    for tid, t in out.items():
+        h = float(np.median(heights[tid])) if heights.get(tid) else 0.0
+        t.metres_per_px = height_m / h if h > 1 else 0.0
+        samples = colours.get(tid)
+        t.colour = np.median(np.array(samples), axis=0) if samples else None
+    return out
+
+
+def _stitch_tracklets(
+    frames: list[_Frame], colours: dict[int, list[np.ndarray]], sport: str
+) -> dict[int, int]:
+    """Merge tracks that are one player whose ID broke (a screen, a crossing).
+
+    A later track is joined onto an earlier one when the earlier ended before
+    the later began (they never coexist), the gap is short, the distance
+    between where one left off and the other started is runnable in that gap,
+    and the kit colours match. Greedy, closest-first. Rewrites ``frames`` and
+    ``colours`` in place and returns the old -> new id mapping.
+    """
+    tracklets = _tracklets(frames, colours, sport)
+    max_speed = MAX_PLAUSIBLE_SPEED_MPS.get(sport, 11.0)
+    candidates: list[tuple[float, int, int]] = []
+    for a in tracklets.values():
+        for b in tracklets.values():
+            gap = b.first_t - a.last_t
+            if a is b or b.first_pos <= a.last_pos or gap > STITCH_MAX_GAP_SEC:
+                continue
+            mpp = a.metres_per_px or b.metres_per_px
+            if not mpp:
+                continue
+            dist_m = (
+                math.hypot(b.first_ref[0] - a.last_ref[0], b.first_ref[1] - a.last_ref[1]) * mpp
+            )
+            if dist_m > max_speed * gap + 1.5:
+                continue
+            if a.colour is not None and b.colour is not None:
+                if float(np.linalg.norm(a.colour - b.colour)) > STITCH_MAX_COLOUR_DIST:
+                    continue
+            candidates.append((dist_m + gap, a.track_id, b.track_id))
+
+    root: dict[int, int] = {tid: tid for tid in tracklets}
+    chain_end: dict[int, int] = {tid: tid for tid in tracklets}  # root -> last tracklet id
+    has_successor: set[int] = set()
+    has_predecessor: set[int] = set()
+    for _, a_id, b_id in sorted(candidates):
+        if a_id in has_successor or b_id in has_predecessor:
+            continue
+        ra = root[a_id]
+        if chain_end[ra] != a_id or root[b_id] == ra:
+            continue
+        # Fold b's whole chain into a's.
+        rb = root[b_id]
+        for tid, r in root.items():
+            if r == rb:
+                root[tid] = ra
+        chain_end[ra] = chain_end[rb]
+        has_successor.add(a_id)
+        has_predecessor.add(b_id)
+
+    for frame in frames:
+        for obs in frame.players:
+            obs.track_id = root.get(obs.track_id, obs.track_id)
+    for old, new in root.items():
+        if old != new and old in colours:
+            colours.setdefault(new, []).extend(colours.pop(old))
+    return root
+
+
+def _renumber_tracks(frames: list[_Frame], colours: dict[int, list[np.ndarray]]) -> None:
+    """Relabel tracks 1..N by first appearance, so viewers never see "#316"."""
+    mapping: dict[int, int] = {}
+    for frame in frames:
+        for obs in frame.players:
+            if obs.track_id not in mapping:
+                mapping[obs.track_id] = len(mapping) + 1
+            obs.track_id = mapping[obs.track_id]
+    renamed = {mapping[k]: v for k, v in colours.items() if k in mapping}
+    colours.clear()
+    colours.update(renamed)
+
+
+# ---------------------------------------------------------------------------
+# Kinematics
+# ---------------------------------------------------------------------------
+
+
+def _smooth(values: np.ndarray, window: int) -> np.ndarray:
+    if len(values) < window or window < 2:
+        return values
+    pad = window // 2
+    kernel = np.ones(window) / window
+    return np.convolve(np.pad(values, pad, mode="edge"), kernel, mode="valid")[: len(values)]
+
+
 def _kinematics(
     frames: list[_Frame], team_of: dict[int, str], sport: str
 ) -> tuple[dict[int, dict[str, Any]], dict[tuple[int, int], float]]:
-    """Distance and speed per player in stabilised, height-scaled metres."""
+    """Distance and speed per player in stabilised, height-scaled metres.
+
+    Positions are smoothed, and speed at each sample is the distance covered
+    over the last ``SPEED_WINDOW_SEC`` divided by that time — not the jump
+    between two frames, which turns box jitter into fake sprints.
+    """
     height_m = PLAYER_HEIGHT_M.get(sport, 1.8)
+    max_speed = MAX_PLAUSIBLE_SPEED_MPS.get(sport, 11.0)
     # track id -> list of (frame position, t, ref_x, ref_y, metres per ref pixel)
     history: dict[int, list[tuple[int, float, float, float, float]]] = {}
     for pos, frame in enumerate(frames):
@@ -447,26 +770,39 @@ def _kinematics(
     for tid, samples in history.items():
         if len(samples) < MIN_TRACK_OBSERVATIONS:
             continue
-        xs = np.array([s[2] for s in samples])
-        ys = np.array([s[3] for s in samples])
-        # 3-sample moving average: box jitter otherwise reads as running.
-        if len(samples) >= 3:
-            kernel = np.ones(3) / 3
-            xs = np.convolve(np.pad(xs, 1, mode="edge"), kernel, mode="valid")
-            ys = np.convolve(np.pad(ys, 1, mode="edge"), kernel, mode="valid")
+        ts = np.array([s[1] for s in samples])
+        xs = _smooth(np.array([s[2] for s in samples]), 5)
+        ys = _smooth(np.array([s[3] for s in samples]), 5)
         mpp = float(np.median([s[4] for s in samples]))
 
         distance = 0.0
-        top = 0.0
         for k in range(1, len(samples)):
-            dt = samples[k][1] - samples[k - 1][1]
+            dt = ts[k] - ts[k - 1]
             if dt <= 0:
                 continue
             step = math.hypot(xs[k] - xs[k - 1], ys[k] - ys[k - 1]) * mpp
-            speed = step / dt
-            if speed > MAX_PLAUSIBLE_SPEED_MPS:
+            if step / dt <= max_speed:
+                distance += step
+
+        # Only trust windows that span the full SPEED_WINDOW_SEC and sit clear
+        # of the track's ends, where edge-padded smoothing ramps the position
+        # in: a short or edge window averages an impossible burst down into a
+        # plausible-looking number instead of exposing it.
+        edge = 2 if len(samples) > 6 else 0
+        top = 0.0
+        j = 0
+        for k in range(1, len(samples)):
+            while j < k - 1 and ts[k] - ts[j + 1] >= SPEED_WINDOW_SEC:
+                j += 1
+            dt = ts[k] - ts[j]
+            if dt <= 0:
                 continue
-            distance += step
+            full_window = dt >= SPEED_WINDOW_SEC * 0.8 or ts[-1] - ts[0] < SPEED_WINDOW_SEC
+            if not full_window or j < edge or k > len(samples) - 1 - edge:
+                continue
+            speed = math.hypot(xs[k] - xs[j], ys[k] - ys[j]) * mpp / dt
+            if speed > max_speed:
+                continue  # an ID switch or bad box, not a player
             top = max(top, speed)
             speeds[(samples[k][0], tid)] = speed
 

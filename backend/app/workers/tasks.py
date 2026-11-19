@@ -95,7 +95,15 @@ def _run_processor(
     raise ValueError(f"No processor for media type {item.media_type!r}")
 
 
-@celery_app.task(bind=True, name="process_data_item", max_retries=2)
+# Tracking a 90-second clip with yolo11s at 1280 px can take well over the
+# app-wide 10-minute limit on a laptop CPU, so this task gets 30 minutes.
+@celery_app.task(
+    bind=True,
+    name="process_data_item",
+    max_retries=2,
+    soft_time_limit=1740,
+    time_limit=1800,
+)
 def process_data_item(self, data_item_id: int) -> dict:
     """Process a single :class:`DataItem` end to end."""
     session = SyncSessionLocal()

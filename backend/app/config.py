@@ -99,7 +99,12 @@ class Settings(BaseSettings):
     tracker: str = Field(default="yolo")
     # Ultralytics weight name or path. A bare name is downloaded on first use;
     # the Dockerfile pre-fetches it so workers do not hit the network per job.
-    detector_weights: str = Field(default="yolo11n.pt")
+    # yolo11s finds the small, fast ball far more often than yolo11n, at ~2.5x
+    # the CPU cost; drop back to yolo11n.pt on a slow machine.
+    detector_weights: str = Field(default="yolo11s.pt")
+    # Detector input size in pixels. 1280 keeps a broadcast-distance ball
+    # visible; 960 or 640 trade ball detection for speed.
+    inference_size: int = Field(default=1280)
     # Frames per second actually run through the detector. Broadcast footage is
     # 25-60 fps; 10 is enough to follow players and keeps CPU cost bounded.
     analysis_fps: float = Field(default=10.0)

@@ -239,6 +239,7 @@ def _analyse(
         weights=settings.detector_weights,
         analysis_fps=settings.analysis_fps,
         max_seconds=settings.max_analysis_seconds,
+        inference_size=settings.inference_size,
     )
     analysis = detect_events(tracks)
     tracks_json = json.dumps(tracks, separators=(",", ":")).encode("utf-8")
